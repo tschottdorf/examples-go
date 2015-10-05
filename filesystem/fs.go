@@ -166,8 +166,8 @@ func validateRename(tx *sql.Tx, source, destination *Node) error {
 		return nil
 	}
 
-	if source.Mode.IsDir() {
-		if destination.Mode.IsDir() {
+	if source.isDir() {
+		if destination.isDir() {
 			// Both are directories: destination must be empty
 			return checkIsEmpty(tx, destination.ID)
 		}
@@ -176,7 +176,7 @@ func validateRename(tx *sql.Tx, source, destination *Node) error {
 	}
 
 	// Source is a file.
-	if destination.Mode.IsDir() {
+	if destination.isDir() {
 		// file -> directory: not allowed.
 		return fuse.Errno(syscall.EISDIR)
 	}
@@ -282,5 +282,15 @@ func (cfs CFS) newDirNode() *Node {
 		cfs:  cfs,
 		ID:   cfs.newUniqueID(),
 		Mode: os.ModeDir | defaultPerms,
+	}
+}
+
+// newSymlinkNode returns a new node struct corresponding to a symlink.
+func (cfs CFS) newSymlinkNode() *Node {
+	return &Node{
+		cfs: cfs,
+		ID:  cfs.newUniqueID(),
+		// Symlinks don't have permissions, allow all.
+		Mode: os.ModeSymlink | allPerms,
 	}
 }

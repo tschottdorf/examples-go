@@ -44,25 +44,33 @@ var _ fs.HandleWriter = &Node{}       // Write
 var _ fs.HandleReader = &Node{}       // Read
 var _ fs.NodeFsyncer = &Node{}        // Fsync
 var _ fs.NodeRenamer = &Node{}        // Rename
+var _ fs.NodeSymlinker = &Node{}      // Symlink
+var _ fs.NodeReadlinker = &Node{}     // Readlink
 
 // Default permissions: we don't have any right now.
 const defaultPerms = 0755
+
+// All permissions.
+const allPerms = 0777
 
 // Maximum file size.
 const maxSize = math.MaxUint64
 
 // Node implements the Node interface.
+// ID, Mode, and Fastlink are currently immutable after node creation.
+// Size (for files only) is protected by mu.
 type Node struct {
 	cfs CFS
-	// These fields are immutable after node creation.
+	// ID is a unique ID allocated at node creation time.
 	ID uint64
 	// Used for type only, permissions are ignored.
 	Mode os.FileMode
+	// Fastlink is the path a symlink points to.
+	Fastlink string
 
 	// Other fields to add:
 	// nLinks: number of hard links
 	// openFDs: number of open file descriptors
-	// fastLink: path for symlink target
 	// timestamps (probably just ctime and mtime)
 
 	// Implicit fields:
@@ -75,6 +83,19 @@ type Node struct {
 	// Any op accessing Size and blocks must lock 'mu'.
 	mu   sync.RWMutex
 	Size uint64
+}
+
+// convenience functions to query the mode.
+func (n Node) isDir() bool {
+	return n.Mode.IsDir()
+}
+
+func (n Node) isRegular() bool {
+	return n.Mode.IsRegular()
+}
+
+func (n Node) isSymlink() bool {
+	return n.Mode&os.ModeSymlink != 0
 }
 
 // toJSON returns the json-encoded string for this node.
@@ -94,7 +115,7 @@ func (n *Node) Attr(_ context.Context, a *fuse.Attr) error {
 	// than regular files?
 	a.BlockSize = BlockSize
 
-	if n.Mode.IsRegular() {
+	if n.isRegular() {
 		n.mu.RLock()
 		defer n.mu.RUnlock()
 		a.Size = n.Size
@@ -102,6 +123,9 @@ func (n *Node) Attr(_ context.Context, a *fuse.Attr) error {
 		// Blocks is the number of 512 byte blocks, regardless of
 		// filesystem blocksize.
 		a.Blocks = (n.Size + 511) / 512
+	} else if n.isSymlink() {
+		// Symlink: use target name length.
+		a.Size = uint64(len(n.Fastlink))
 	}
 	return nil
 }
@@ -113,7 +137,7 @@ func (n *Node) Setattr(_ context.Context, req *fuse.SetattrRequest, resp *fuse.S
 		return nil
 	}
 
-	if !n.Mode.IsRegular() {
+	if !n.isRegular() {
 		// Setting the size is only available on regular files.
 		return fuse.Errno(syscall.EINVAL)
 	}
@@ -174,7 +198,7 @@ func (n *Node) Setattr(_ context.Context, req *fuse.SetattrRequest, resp *fuse.S
 //
 // Lookup need not to handle the names "." and "..".
 func (n *Node) Lookup(_ context.Context, name string) (fs.Node, error) {
-	if !n.Mode.IsDir() {
+	if !n.isDir() {
 		return nil, fuse.Errno(syscall.ENOTDIR)
 	}
 	node, err := n.cfs.lookup(n.ID, name)
@@ -190,7 +214,7 @@ func (n *Node) Lookup(_ context.Context, name string) (fs.Node, error) {
 
 // ReadDirAll returns the list of child inodes.
 func (n *Node) ReadDirAll(_ context.Context) ([]fuse.Dirent, error) {
-	if !n.Mode.IsDir() {
+	if !n.isDir() {
 		return nil, fuse.Errno(syscall.ENOTDIR)
 	}
 	return n.cfs.list(n.ID)
@@ -200,7 +224,7 @@ func (n *Node) ReadDirAll(_ context.Context) ([]fuse.Dirent, error) {
 // We let the sql query fail if the directory already exists.
 // TODO(marc): better handling of errors.
 func (n *Node) Mkdir(_ context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	if !n.Mode.IsDir() {
+	if !n.isDir() {
 		return nil, fuse.Errno(syscall.ENOTDIR)
 	}
 	if !req.Mode.IsDir() {
@@ -218,7 +242,7 @@ func (n *Node) Mkdir(_ context.Context, req *fuse.MkdirRequest) (fs.Node, error)
 // Create creates a new file in the receiver directory.
 func (n *Node) Create(_ context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (
 	fs.Node, fs.Handle, error) {
-	if !n.Mode.IsDir() {
+	if !n.isDir() {
 		return nil, nil, fuse.Errno(syscall.ENOTDIR)
 	}
 	if req.Mode.IsDir() {
@@ -237,7 +261,7 @@ func (n *Node) Create(_ context.Context, req *fuse.CreateRequest, resp *fuse.Cre
 
 // Remove may be unlink or rmdir.
 func (n *Node) Remove(_ context.Context, req *fuse.RemoveRequest) error {
-	if !n.Mode.IsDir() {
+	if !n.isDir() {
 		return fuse.Errno(syscall.ENOTDIR)
 	}
 
@@ -245,13 +269,13 @@ func (n *Node) Remove(_ context.Context, req *fuse.RemoveRequest) error {
 		// Rmdir.
 		return n.cfs.remove(n.ID, req.Name, true /* checkChildren */)
 	}
-	// Unlink.
+	// Unlink file/symlink.
 	return n.cfs.remove(n.ID, req.Name, false /* !checkChildren */)
 }
 
 // Write writes data to 'n'. It may overwrite existing data, or grow it.
 func (n *Node) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	if !n.Mode.IsRegular() {
+	if !n.isRegular() {
 		return fuse.Errno(syscall.EINVAL)
 	}
 	if req.Offset < 0 {
@@ -311,7 +335,7 @@ func (n *Node) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.Write
 
 // Read reads data from 'n'.
 func (n *Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	if !n.Mode.IsRegular() {
+	if !n.isRegular() {
 		return fuse.Errno(syscall.EINVAL)
 	}
 	if req.Offset < 0 {
@@ -361,8 +385,33 @@ func (n *Node) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.No
 	if !ok {
 		return fmt.Errorf("newDir is not a Node: %v", newDir)
 	}
-	if !n.Mode.IsDir() || !newNode.Mode.IsDir() {
+	if !n.isDir() || !newNode.isDir() {
 		return fuse.Errno(syscall.ENOTDIR)
 	}
 	return n.cfs.rename(n.ID, newNode.ID, req.OldName, req.NewName)
+}
+
+// Symlink creates a new symbolic link in the receiver node, which must
+// be a directory.
+func (n *Node) Symlink(_ context.Context, req *fuse.SymlinkRequest) (fs.Node, error) {
+	if !n.isDir() {
+		return nil, fuse.Errno(syscall.ENOTDIR)
+	}
+	// TODO(marc): have a max target length. If exceeded, either return ENAMETOOLONG,
+	// or store as slow link in a block.
+	node := n.cfs.newSymlinkNode()
+	node.Fastlink = req.Target
+	err := n.cfs.create(n.ID, req.NewName, node)
+	if err != nil {
+		return nil, err
+	}
+	return node, nil
+}
+
+// Readlink reads a symbolic link.
+func (n *Node) Readlink(_ context.Context, req *fuse.ReadlinkRequest) (string, error) {
+	if !n.isSymlink() {
+		return "", fuse.Errno(syscall.EINVAL)
+	}
+	return n.Fastlink, nil
 }
